@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Diagnóstico Inteligente de Motores DC — Proyecto Kb (Expo ICE Impulsa 2026)
 
 Sistema de adquisición, análisis de transitorios eléctricos de arranque (*Inrush*) y diagnóstico automático de fallas en motores de corriente directa mediante modelado dinámico RL de 1er orden e Inteligencia Artificial ligera.
@@ -24,3 +25,6 @@ ICE2026_MotorDiagnostico/
 │       └── main_window.py         # Ventana principal, lotes CSV y reporte diagnóstico
 ├── firmware_arduino/              # Control de matriz de selección de voltajes (0V a 25V)
 └── docs_latex/                    # Reportes técnicos de avance y esquemáticos
+=======
+# ICE2026_MotorDiagnostico
+>>>>>>> 857be5511428fb47932de7b8a0aea6c0f0cb915c
