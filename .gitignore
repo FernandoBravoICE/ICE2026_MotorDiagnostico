@@ -1,0 +1,28 @@
+# Entornos virtuales de Python
+.venv/
+venv/
+env/
+
+# Caché y compilados de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Archivos auxiliares de compilación LaTeX (conserva .tex y .pdf)
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.gz
+
+# Configuración local de IDEs y Sistema Operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
