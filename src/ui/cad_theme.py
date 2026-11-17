@@ -126,6 +126,17 @@ QGroupBox::title {
     color: #0f172a;
 }
 
+QLineEdit, QComboBox {
+    background-color: #ffffff;
+    color: #0f172a;
+    border: 1px solid #94a3b8;
+    border-radius: 3px;
+    padding: 3px 6px;
+}
+QLineEdit:focus, QComboBox:focus {
+    border-color: #2563eb;
+}
+
 QTableWidget {
     background-color: #ffffff;
     alternate-background-color: #f1f5f9;
@@ -180,7 +191,7 @@ QProgressBar::chunk {
     border-radius: 2px;
 }
 
-QPlainTextEdit {
+QTextEdit, QPlainTextEdit {
     background-color: #0f172a;
     color: #e2e8f0;
     border: 1px solid #334155;

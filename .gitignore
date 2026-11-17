@@ -26,3 +26,7 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+#sql
+database/db_config.json
+database/*.db

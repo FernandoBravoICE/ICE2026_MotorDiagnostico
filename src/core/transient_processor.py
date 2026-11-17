@@ -5,25 +5,17 @@ Descripción:
     Procesamiento numérico, extracción de parámetros físicos y graficación
     de transitorios eléctricos a partir de archivos CSV generados por
     recolector_pru_2_ver2.py (Captura SRAM 4 kHz + 100 ms pre-trigger).
-
-Cambios respecto a la versión anterior:
-    - `integrar_trapecio()`: compatible con NumPy 1.x y 2.x (np.trapz fue retirado).
-    - `TransientAnalysisResult.to_baseline_dict()` / `from_baseline_dict()`:
-      permiten guardar y restaurar la curva base junto con el modelo de IA.
-    - `configurar_salida_utf8()`: evita UnicodeEncodeError en consolas cp1252
-      (se llama solo al ejecutar el archivo directamente, no al importarlo).
-    - `resolver_csv_por_defecto()`: búsqueda del CSV independiente del directorio
-      de trabajo, con mensaje de error que lista las rutas probadas.
 """
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+import re
 import sys
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 # ==============================================================================
@@ -59,8 +51,7 @@ def integrar_trapecio(y: np.ndarray, x: np.ndarray) -> float:
 def configurar_salida_utf8() -> None:
     """
     Fuerza UTF-8 en stdout/stderr para evitar UnicodeEncodeError en consolas
-    de Windows con cp1252. Llamar solo desde bloques `if __name__ == "__main__"`:
-    no debe ejecutarse al importar el módulo desde la interfaz gráfica.
+    de Windows con cp1252. Llamar solo desde bloques `if __name__ == "__main__"`.
     """
     for flujo in (sys.stdout, sys.stderr):
         reconfigurar = getattr(flujo, "reconfigure", None)
@@ -78,7 +69,6 @@ def resolver_csv_por_defecto(argv: Optional[Sequence[str]] = None) -> Path:
       2. <raíz del proyecto>/datasets/raw/dataset_Motor_prueba_12V.csv
       3. datasets/raw/... y archivo suelto en el directorio de trabajo actual.
       4. Archivo suelto junto a este módulo.
-    Lanza FileNotFoundError con todas las rutas probadas si no encuentra ninguna.
     """
     if argv is not None and len(argv) > 1:
         candidatos = [Path(argv[1])]
@@ -148,8 +138,7 @@ class TransientAnalysisResult:
     def to_baseline_dict(self) -> Dict[str, Any]:
         """
         Devuelve solo los parámetros escalares del transitorio (sin vectores de señal).
-        Es todo lo que `to_feature_dict(baseline=...)` necesita de una curva base,
-        y es seguro de guardar con joblib/JSON.
+        Es todo lo que `to_feature_dict(baseline=...)` necesita de una curva base.
         """
         datos: Dict[str, Any] = {}
         for campo in fields(self):
@@ -169,6 +158,9 @@ class TransientAnalysisResult:
         Reconstruye una curva base mínima (vectores vacíos) a partir de `to_baseline_dict()`.
         Sirve para normalizar features; no se puede graficar.
         """
+        if not isinstance(datos, dict):
+            raise TypeError("El baseline debe ser un diccionario.")
+
         vacio = np.empty(0, dtype=float)
         kwargs: Dict[str, Any] = {}
         faltantes: List[str] = []
@@ -194,8 +186,8 @@ class TransientAnalysisResult:
         self, baseline: Optional["TransientAnalysisResult"] = None
     ) -> Dict[str, Any]:
         """
-        Vector completo de 16 características numéricas + metadatos para IA ligera.
-        Si se proporciona `baseline` (Escenario 1: Operación Normal), calcula además
+        Vector completo de 21 características numéricas (20 usadas por el clasificador)
+        + metadatos para IA ligera. Si se proporciona `baseline` (Escenario 1), calcula
         las desviaciones relativas respecto al estado sano del motor.
         """
         t_estab_s = (
@@ -280,7 +272,7 @@ def procesar_senal_numerica(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Interpolación uniforme (4 kHz) + filtro mediana de 3 puntos + suavizado Gaussiano.
-    Conserva exactamente el algoritmo de recolector_pru_2_ver2.py.
+    Conserva el algoritmo de recolector_pru_2_ver2.py.
     """
     t_mono = np.array(t_raw, dtype=float)
     for k in range(1, len(t_mono)):
@@ -314,9 +306,7 @@ def procesar_senal_numerica(
 
 
 class TransientProcessor:
-    """
-    Procesador offline de datasets CSV para diagnóstico de motores DC.
-    """
+    """Procesador offline de datasets CSV para diagnóstico de motores DC."""
 
     def __init__(
         self,
@@ -343,35 +333,53 @@ class TransientProcessor:
 
         # 1. Identificación de columnas (formato SRAM nuevo vs Timestamp legado)
         if "tiempo(s)" in df.columns:
-            t_col = df["tiempo(s)"].astype(float).values
+            t_col = pd.to_numeric(df["tiempo(s)"], errors="coerce").values
             ya_disparado = True
         elif "timestamp" in df.columns:
-            t_abs = df["timestamp"].astype(float).values
-            t_col = t_abs - t_abs[0]
+            t_abs = pd.to_numeric(df["timestamp"], errors="coerce").values
+            t_col = t_abs - t_abs[0] if len(t_abs) > 0 else t_abs
             ya_disparado = False
         elif "tiempo" in df.columns:
-            t_col = df["tiempo"].astype(float).values
-            ya_disparado = bool(np.min(t_col) < 0.0)
+            t_col = pd.to_numeric(df["tiempo"], errors="coerce").values
+            ya_disparado = bool(np.nanmin(t_col) < 0.0) if len(t_col) > 0 else False
         else:
             raise ValueError(f"'{path.name}' no contiene columna 'Tiempo(s)' ni 'Timestamp'.")
 
-        v_col = next((c for c in df.columns if c.startswith("voltaje")), None)
-        i_col = next((c for c in df.columns if c.startswith("corriente")), None)
+        v_col = next((c for c in df.columns if c.startswith(("voltaje", "tension", "v_"))), None)
+        i_col = next((c for c in df.columns if c.startswith(("corriente", "i_"))), None)
         if not v_col or not i_col:
             raise ValueError(f"'{path.name}' debe contener columnas de Voltaje y Corriente.")
 
-        v_arr = df[v_col].astype(float).values
-        i_raw_col = df[i_col].astype(float).values
+        v_arr = pd.to_numeric(df[v_col], errors="coerce").values
+        i_raw_col = pd.to_numeric(df[i_col], errors="coerce").values
 
-        # Normalizar corriente internamente a mA (convención de recolector_pru_2_ver2.py)
-        es_amperes = ("(a)" in i_col) or (np.nanmax(np.abs(i_raw_col)) <= 25.0 and "(ma)" not in i_col)
+        # Filtrar filas corruptas / NaN / Inf para evitar contaminación numérica
+        valid_mask = np.isfinite(t_col) & np.isfinite(v_arr) & np.isfinite(i_raw_col)
+        if not np.all(valid_mask):
+            t_col = t_col[valid_mask]
+            v_arr = v_arr[valid_mask]
+            i_raw_col = i_raw_col[valid_mask]
+
+        if len(t_col) < 5:
+            raise ValueError(f"'{path.name}' no contiene suficientes muestras numéricas válidas.")
+
+        # Normalizar corriente internamente a mA (detecta (mA), _ma, [mA], (A), _a, [A])
+        tiene_unidad_ma = bool(re.search(r"(?:^|[^a-z])ma(?:[^a-z]|$)", i_col))
+        tiene_unidad_a = bool(re.search(r"(?:^|[^a-z])a(?:[^a-z]|$)", i_col))
+        if tiene_unidad_ma:
+            es_amperes = False
+        elif tiene_unidad_a:
+            es_amperes = True
+        else:
+            es_amperes = float(np.max(np.abs(i_raw_col))) <= 25.0
+
         i_ma_arr = (i_raw_col * 1000.0) if es_amperes else i_raw_col.copy()
 
-        label = (
-            str(df["estado"].iloc[0]).strip()
-            if "estado" in df.columns and len(df) > 0 and pd.notna(df["estado"].iloc[0])
-            else "Sin_Etiqueta"
-        )
+        label = "Sin_Etiqueta"
+        if "estado" in df.columns:
+            estados_validos = df["estado"].dropna()
+            if len(estados_validos) > 0:
+                label = str(estados_validos.iloc[0]).strip() or "Sin_Etiqueta"
 
         # 2. Separación de ventana pre-trigger (-100 ms) y anclaje estricto en t = 0.0 s
         if ya_disparado and np.min(t_col) < 0.0:
@@ -405,7 +413,7 @@ class TransientProcessor:
         # 3. Descartar tramo apagado si se cortó el motor dentro del registro
         v_ref_on = float(np.max(v_seg[:min(len(v_seg), 500)]))
         apagado = np.where((t_seg > 0.25) & (v_seg < 0.70 * v_ref_on))[0]
-        if len(apagado) > 0:
+        if len(apagado) > 0 and int(apagado[0]) >= 10:
             idx_fin_on = int(apagado[0])
             t_seg = t_seg[:idx_fin_on]
             v_seg = v_seg[:idx_fin_on]
@@ -417,7 +425,7 @@ class TransientProcessor:
         _, i_env = procesar_senal_numerica(t_seg, i_seg, self.dt_uniforme, SIGMA_ENVOLVENTE_MS)
         _, v_env = procesar_senal_numerica(t_seg, v_seg, self.dt_uniforme, SIGMA_ENVOLVENTE_MS)
 
-        # 5. Detector adaptativo de estabilización (mismo criterio que recolector_pru_2_ver2.py)
+        # 5. Detector adaptativo de estabilización
         lim_busqueda = min(len(i_smooth), max(int(0.5 / self.dt_uniforme), int(len(i_smooth) * 0.5)))
         idx_pico = int(np.argmax(i_smooth[:lim_busqueda]))
         t_pico = float(t_uni[idx_pico])
@@ -427,6 +435,7 @@ class TransientProcessor:
         win_n = max(10, int(win_s / self.dt_uniforme))
         t_fin_transitorio = float(t_uni[-1])
         t_estab_detectado: Optional[float] = None
+        tol_banda_v = max(0.08, 0.01 * v_ref_on)
 
         for k in range(idx_pico + int(0.06 / self.dt_uniforme), len(t_uni) - win_n):
             if v_env[k + win_n - 1] < 0.70 * np.max(v_env[:k + win_n]):
@@ -445,7 +454,7 @@ class TransientProcessor:
                 caida >= max(3.0, 0.20 * i_max)
                 and banda_i < max(2.5, 0.035 * caida)
                 and pendiente_i < 25.0
-                and banda_v < 0.08
+                and banda_v < tol_banda_v
             ):
                 t_estab_detectado = float(t_uni[k + win_n // 2])
                 margen = max(0.12, 0.20 * t_estab_detectado)
@@ -468,7 +477,7 @@ class TransientProcessor:
         i_ss = float(np.mean(i_plot[mask_ss]))
         v_ss = float(np.mean(v_plot[mask_ss]))
 
-        # Respaldo por banda ±5% si el CSV venía recortado justo en el margen
+        # Respaldo por banda ±5% si el CSV venía recortado justo en el margen o sin caída (bloqueo)
         if t_estab_detectado is None:
             tol_5 = max(5.0, 0.05 * i_ss)
             fuera = np.where(np.abs(i_plot - i_ss) > tol_5)[0]
@@ -476,19 +485,25 @@ class TransientProcessor:
                 t_estab_detectado = float(t_plot[fuera[-1] + 1])
 
         # Constante de tiempo τ (caída del 63.2% desde el pico hacia Iss)
-        i_tau_obj = i_max - 0.632 * (i_max - i_ss)
-        t_post = t_plot[idx_pico:]
-        i_post = i_plot[idx_pico:]
-        cruces = np.where(i_post <= i_tau_obj)[0]
-        if len(cruces) > 0:
-            k_c = int(cruces[0])
-            if k_c > 0 and i_post[k_c - 1] != i_post[k_c]:
-                frac = (i_post[k_c - 1] - i_tau_obj) / (i_post[k_c - 1] - i_post[k_c])
-                t_tau = float(t_post[k_c - 1] + frac * (t_post[k_c] - t_post[k_c - 1]))
+        if i_max > i_ss * 1.02:
+            i_tau_obj = i_max - 0.632 * (i_max - i_ss)
+            t_post = t_plot[idx_pico:]
+            i_post = i_plot[idx_pico:]
+            cruces = np.where(i_post <= i_tau_obj)[0]
+            if len(cruces) > 0:
+                k_c = int(cruces[0])
+                if k_c > 0 and i_post[k_c - 1] != i_post[k_c]:
+                    frac = (i_post[k_c - 1] - i_tau_obj) / (i_post[k_c - 1] - i_post[k_c])
+                    t_tau = float(t_post[k_c - 1] + frac * (t_post[k_c] - t_post[k_c - 1]))
+                else:
+                    t_tau = float(t_post[k_c])
+                tau_ms = max(0.0, (t_tau - t_pico) * 1000.0)
             else:
-                t_tau = float(t_post[k_c])
-            tau_ms = max(0.0, (t_tau - t_pico) * 1000.0)
+                t_tau = t_pico
+                tau_ms = 0.0
         else:
+            # Curva plana sin caída transitoria apreciable (típico en rotor bloqueado)
+            i_tau_obj = i_max
             t_tau = t_pico
             tau_ms = 0.0
 
@@ -505,7 +520,11 @@ class TransientProcessor:
         # Métricas de frecuencia de adquisición
         dt_us_all = np.diff(t_raw_plot) * 1e6
         dt_med_us = float(np.median(dt_us_all)) if len(dt_us_all) > 0 else 0.0
-        fs_real_hz = float(1e6 / np.mean(dt_us_all)) if (len(dt_us_all) > 0 and np.mean(dt_us_all) > 0) else 0.0
+        fs_real_hz = (
+            float(1e6 / np.mean(dt_us_all))
+            if (len(dt_us_all) > 0 and np.mean(dt_us_all) > 0)
+            else 0.0
+        )
 
         return TransientAnalysisResult(
             source_name=path.name,
@@ -561,9 +580,8 @@ class TransientProcessor:
 
 def graficar_transitorio_sram(res: TransientAnalysisResult, diagnostico_ia: Optional[str] = None) -> None:
     """
-    Renderiza la gráfica dual (Voltaje y Corriente) bajo los principios exactos
-    de recolector_pru_2_ver2.py: anclada en t=0, doble trazo crudo/suavizado,
-    marcadores de pico, tau (63.2%), estabilización e Iss/Vss.
+    Renderiza la gráfica dual (Voltaje y Corriente) anclada en t=0, con doble trazo
+    crudo/suavizado, marcadores de pico, tau (63.2%), estabilización e Iss/Vss.
     """
     fig, (ax_v, ax_i) = plt.subplots(1, 2, figsize=(15, 6.5))
     titulo_ventana = f"Análisis Transitorio — {res.source_name} [{res.label}]"
@@ -611,7 +629,6 @@ def graficar_transitorio_sram(res: TransientAnalysisResult, diagnostico_ia: Opti
     ax_i.grid(True, linestyle=":", alpha=0.75)
     ax_i.legend(loc="upper right")
 
-    # Cuadro resumen técnico idéntico al recolector + métricas energéticas e IA
     estab_txt = f"{res.t_estab_ms:.0f} ms" if res.t_estab_ms is not None else "Fin búfer"
     diag_linea = f"\nDIAGNÓSTICO IA : {diagnostico_ia}" if diagnostico_ia else ""
     resumen = (
@@ -638,7 +655,6 @@ def graficar_transitorio_sram(res: TransientAnalysisResult, diagnostico_ia: Opti
 
 
 if __name__ == "__main__":
-    # Uso desde consola: python src/core/transient_processor.py ruta/al/dataset.csv
     configurar_salida_utf8()
 
     ruta_csv = resolver_csv_por_defecto(sys.argv)

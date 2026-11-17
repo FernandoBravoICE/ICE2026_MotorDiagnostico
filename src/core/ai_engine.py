@@ -5,30 +5,16 @@ Descripción:
     Motor de Inteligencia Artificial ligera (Random Forest + Respaldo Físico RL)
     para clasificar automáticamente la condición operativa del motor DC en los
     5 escenarios obligatorios a partir de sus transitorios eléctricos:
-      1. NORMAL
-      2. SOBRECARGA
-      3. BAJO_VOLTAJE
-      4. ROZAMIENTO_MECANICO
-      5. BLOQUEO_PARCIAL
-
-Cambios respecto a la versión anterior:
-    - El modelo guardado incluye la curva base (baseline); load_model() la restaura.
-      Antes, tras reiniciar la app, diagnose() calculaba las features sin baseline
-      y el modelo recibía valores distintos a los del entrenamiento.
-    - load_model() rechaza modelos de formato antiguo o con FEATURE_COLUMNS distintas,
-      y no revienta si el archivo está dañado.
-    - normalizar_etiqueta_estado() compara palabras completas (no subcadenas) y
-      devuelve DESCONOCIDO ante etiquetas ambiguas en lugar de adivinar.
-    - La validación del bootstrap se reporta como consistencia SINTÉTICA, no como
-      precisión del modelo (los datos de entrenamiento salen del mismo simulador).
-    - np.trapz reemplazado por integrar_trapecio() (compatible con NumPy 1.x y 2.x).
-    - Rutas por defecto relativas a la raíz del proyecto, no al directorio de trabajo.
-    - La reconfiguración UTF-8 de la consola solo ocurre al ejecutar el archivo directo.
+    1. NORMAL
+    2. SOBRECARGA
+    3. BAJO_VOLTAJE
+    4. ROZAMIENTO_MECANICO
+    5. BLOQUEO_PARCIAL
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import re
 import sys
 import unicodedata
@@ -45,6 +31,7 @@ MODELO_POR_DEFECTO = RAIZ_PROYECTO / "models" / "motor_rf_classifier.joblib"
 
 # Soporte de importación tanto desde la raíz del proyecto como ejecutando el archivo directo
 try:
+    from src.core.motor_profile import MotorSpecProfile
     from src.core.transient_processor import (
         TransientAnalysisResult,
         TransientProcessor,
@@ -54,6 +41,7 @@ try:
     )
 except ImportError:
     sys.path.append(str(RAIZ_PROYECTO))
+    from src.core.motor_profile import MotorSpecProfile
     from src.core.transient_processor import (
         TransientAnalysisResult,
         TransientProcessor,
@@ -118,7 +106,7 @@ _TOKENS_NORMAL = frozenset({"NORMAL", "SANO", "NUEVO", "BASE", "BASELINE", "NOMI
 _TOKENS_BAJO = frozenset({"BAJO", "BAJA", "UNDERVOLTAGE"})
 _TOKENS_VOLTAJE = frozenset({"VOLTAJE", "TENSION"})
 _TOKENS_SUBVOLTAJE = frozenset({"SUBTENSION", "SUBVOLTAJE"})
-_VOLTAJE_REDUCIDO_MAX_V = 10.5  # etiquetas como "9V" o "6V" se consideran bajo voltaje (nominal 12 V)
+_VOLTAJE_REDUCIDO_MAX_V = 10.5
 
 
 def _quitar_acentos(texto: str) -> str:
@@ -134,13 +122,6 @@ def normalizar_etiqueta_estado(raw_label: str) -> str:
     """
     Mapea etiquetas libres de CSVs ('Motor_Nuevo', 'Con_Friccion', 'ESC4', etc.) a las
     5 clases oficiales, o a 'DESCONOCIDO'.
-
-    Reglas:
-      1. Coincidencia exacta con una clase canónica.
-      2. Patrón de escenario: ESC1..ESC5 / ESCENARIO_1..ESCENARIO_5.
-      3. Palabras completas (no subcadenas): 'DESCARGA' ya no cuenta como 'CARGA'.
-      4. Las fallas tienen prioridad sobre NORMAL ('Motor_Nuevo_Con_Friccion' -> ROZAMIENTO).
-      5. Si aparecen señales de dos fallas distintas -> 'DESCONOCIDO' (no se adivina).
     """
     texto = _quitar_acentos(str(raw_label)).strip().upper()
     texto = re.sub(r"[^A-Z0-9.]+", "_", texto).strip("_")
@@ -164,7 +145,6 @@ def normalizar_etiqueta_estado(raw_label: str) -> str:
     ):
         candidatas.add("BAJO_VOLTAJE")
     elif hay_bajo and not candidatas:
-        # "Bajo" a secas, sin otra pista -> se mantiene el comportamiento histórico
         candidatas.add("BAJO_VOLTAJE")
 
     if len(candidatas) == 1:
@@ -188,6 +168,8 @@ class DiagnosticReport:
     sintomas_detectados: List[str]
     recomendacion_tecnica: str
     probabilidades_clase: Dict[str, float] = field(default_factory=dict)
+    perfil_motor: Optional[str] = None
+    id_motor: Optional[int] = None
 
     def formatear_reporte_texto(self) -> str:
         """Genera el bloque de salida técnica alineado con el formato esperado de Expo ICE 2026."""
@@ -199,10 +181,16 @@ class DiagnosticReport:
         e_j = self.parametros_clave.get("e_arranque_j", 0.0)
         p_max = self.parametros_clave.get("p_max_w", 0.0)
 
+        linea_perfil = (
+            f"Perfil de motor : {self.perfil_motor}\n"
+            if self.perfil_motor
+            else ""
+        )
         sintomas_str = "\n".join(f"  - {s}" for s in self.sintomas_detectados)
         return (
             f"Estado detectado: {self.estado_detectado} (Confianza: {self.confianza_pct:.1f}%)\n"
             f"Severidad       : {self.severidad} | Motor IA: {self.metodo_inferencia}\n"
+            f"{linea_perfil}"
             f"────────────────────────────────────────────────────────\n"
             f"Voltaje estable         = {v_ss:.2f} V\n"
             f"Corriente pico          = {i_pico:.2f} A ({i_pico*1000:.0f} mA)\n"
@@ -219,13 +207,15 @@ class DiagnosticReport:
 
 class MotorDiagnosticAI:
     """
-    Motor de diagnóstico inteligente ligero (Random Forest + Reglas Físicas RL).
+    Motor de diagnóstico inteligente ligero (Random Forest + Reglas Físicas RL
+    + Calibración opcional por Perfil Nominal de Placa / SQLite).
     """
 
     def __init__(self, model_path: str | Path = MODELO_POR_DEFECTO):
         self.model_path = Path(model_path)
         self.classifier: Optional[RandomForestClassifier] = None
         self.baseline_result: Optional[TransientAnalysisResult] = None
+        self.motor_profile: Optional[MotorSpecProfile] = None
         self.training_metrics: Dict[str, Any] = {}
 
         if self.model_path.exists():
@@ -234,17 +224,21 @@ class MotorDiagnosticAI:
     def set_baseline(self, baseline: TransientAnalysisResult) -> None:
         """
         Define la curva base de referencia (Escenario 1: Operación Normal).
-
-        Ojo: si ya hay un clasificador entrenado, cambiar el baseline cambia la
-        normalización de las features y el modelo deja de ser consistente.
-        Reentrena (train_from_results / bootstrap_from_baseline) después de cambiarlo.
+        Si ya hay un clasificador entrenado, reentrena después de cambiarla.
         """
         self.baseline_result = baseline
+
+    def set_motor_profile(self, profile: Optional[MotorSpecProfile]) -> None:
+        """Asigna especificaciones nominales opcionales (manuales o desde SQLite)."""
+        self.motor_profile = profile
 
     # ==========================================================================
     # PERSISTENCIA DEL MODELO (clasificador + baseline)
     # ==========================================================================
     def save_model(self, path: Optional[str | Path] = None) -> Path:
+        if self.classifier is None:
+            raise RuntimeError("No hay ningún clasificador entrenado para guardar.")
+
         target = Path(path) if path else self.model_path
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -260,8 +254,7 @@ class MotorDiagnosticAI:
     def load_model(self, path: Optional[str | Path] = None) -> bool:
         """
         Carga clasificador + baseline. Devuelve False (sin lanzar excepción) si el archivo
-        no existe, está dañado, es de formato antiguo o fue entrenado con otras features;
-        en ese caso el sistema usa el motor físico de respaldo hasta reentrenar.
+        no existe, está dañado, es de formato antiguo o fue entrenado con otras features.
         """
         target = Path(path) if path else self.model_path
         if not target.exists():
@@ -272,14 +265,16 @@ class MotorDiagnosticAI:
         except Exception as exc:
             warnings.warn(
                 f"No se pudo leer el modelo '{target.name}' ({exc}). Se usa el motor físico de respaldo.",
-                RuntimeWarning, stacklevel=2,
+                RuntimeWarning,
+                stacklevel=2,
             )
             return False
 
         if not isinstance(payload, dict) or payload.get("classifier") is None:
             warnings.warn(
                 f"El archivo '{target.name}' no contiene un clasificador válido.",
-                RuntimeWarning, stacklevel=2,
+                RuntimeWarning,
+                stacklevel=2,
             )
             return False
 
@@ -287,7 +282,8 @@ class MotorDiagnosticAI:
             warnings.warn(
                 f"El modelo '{target.name}' fue entrenado con otras FEATURE_COLUMNS. "
                 "Reentrena el modelo; se usa el motor físico de respaldo.",
-                RuntimeWarning, stacklevel=2,
+                RuntimeWarning,
+                stacklevel=2,
             )
             return False
 
@@ -296,7 +292,8 @@ class MotorDiagnosticAI:
                 f"El modelo '{target.name}' es de formato antiguo y no guarda la curva base: "
                 "sus predicciones serían incorrectas. Reentrena el modelo; "
                 "se usa el motor físico de respaldo.",
-                RuntimeWarning, stacklevel=2,
+                RuntimeWarning,
+                stacklevel=2,
             )
             return False
 
@@ -305,10 +302,11 @@ class MotorDiagnosticAI:
         if datos_baseline:
             try:
                 baseline = TransientAnalysisResult.from_baseline_dict(datos_baseline)
-            except ValueError as exc:
+            except (ValueError, TypeError) as exc:
                 warnings.warn(
                     f"Curva base del modelo '{target.name}' inválida ({exc}). Reentrena el modelo.",
-                    RuntimeWarning, stacklevel=2,
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
                 return False
 
@@ -329,7 +327,6 @@ class MotorDiagnosticAI:
         Entrena el clasificador Random Forest ligero a partir de una lista de
         resultados procesados de CSVs reales etiquetados.
         """
-        # Detectar automáticamente una curva base 'NORMAL' si no fue fijada manualmente
         if self.baseline_result is None:
             normales = [r for r in results if normalizar_etiqueta_estado(r.label) == "NORMAL"]
             if normales:
@@ -350,7 +347,8 @@ class MotorDiagnosticAI:
             warnings.warn(
                 f"{len(omitidos)} archivo(s) omitido(s) por etiqueta no reconocida: "
                 + "; ".join(omitidos),
-                RuntimeWarning, stacklevel=2,
+                RuntimeWarning,
+                stacklevel=2,
             )
 
         df_train = pd.DataFrame(rows)
@@ -372,7 +370,6 @@ class MotorDiagnosticAI:
             random_state=42,
         )
 
-        # Validación cruzada si hay suficientes muestras por clase
         min_class_count = int(y.value_counts().min())
         if min_class_count >= 3:
             n_splits = min(5, min_class_count)
@@ -415,12 +412,7 @@ class MotorDiagnosticAI:
         """
         Genera un entrenamiento sintético calibrado físicamente usando el modelo
         RL dinámico de 1er orden (V_th = (Rw + Rm(t))*i + L*di/dt) a partir de una
-        sola curva base real (Escenario 1), permitiendo diagnosticar los 5 estados
-        antes de completar toda la matriz experimental.
-
-        IMPORTANTE: casi todas las muestras son sintéticas y los rangos de cada clase
-        se definen aquí mismo, por lo que la métrica devuelta mide consistencia con el
-        simulador, NO precisión sobre motores reales.
+        sola curva base real (Escenario 1).
         """
         self.set_baseline(baseline)
         rng = np.random.default_rng(42)
@@ -430,22 +422,45 @@ class MotorDiagnosticAI:
         i_ss_base = max(baseline.i_ss_ma / 1000.0, 0.05)
         tau_base_s = max(baseline.tau_ms / 1000.0, 0.03)
 
-        # Estimación física de Rw y Rm_inf del motor real bajo prueba
-        rw_est = float(np.clip(v_nom / (i_pico_base * 1.15), 1.0, 15.0))
+        # Estimación física de Rw y Rm_inf del motor real bajo prueba (o tomada de placa)
+        if (
+            self.motor_profile is not None
+            and self.motor_profile.rw_ohm is not None
+            and self.motor_profile.rw_ohm > 0
+        ):
+            rw_est = float(self.motor_profile.rw_ohm)
+        else:
+            rw_est = float(np.clip(v_nom / (i_pico_base * 1.15), 1.0, 15.0))
+
         r_total_ss = v_nom / i_ss_base
         r_minf_est = max(2.0, r_total_ss - rw_est)
-        L_est = float(np.clip(rw_est * 0.008, 0.005, 0.08))
 
-        def _simular_curva_rl(v_th: float, rw: float, L: float, r_minf: float, tau_m: float, clase: str) -> Dict[str, Any]:
+        if (
+            self.motor_profile is not None
+            and self.motor_profile.l_mh is not None
+            and self.motor_profile.l_mh > 0
+        ):
+            L_est = float(self.motor_profile.l_mh) / 1000.0
+        else:
+            L_est = float(np.clip(rw_est * 0.008, 0.005, 0.08))
+
+        def _simular_curva_rl(
+            v_th: float, rw: float, L: float, r_minf: float, tau_m: float, clase: str
+        ) -> Dict[str, Any]:
             dt = 0.0005
             dur = max(1.8, 4.5 * tau_m)
             t = np.arange(0.0, dur, dt)
             i = np.zeros_like(t)
             curr = 0.0
+            tau_m_safe = max(tau_m, 1e-4)
+            L_safe = max(L, 1e-5)
+
+            # Paso exponencial exacto local: incondicionalmente estable para cualquier R, L y dt
             for k in range(1, len(t)):
-                rm = r_minf * (1.0 - np.exp(-t[k] / max(tau_m, 1e-4))) ** 2
-                di = (v_th - curr * (rw + rm)) / L
-                curr += di * dt
+                rm = r_minf * (1.0 - np.exp(-t[k] / tau_m_safe)) ** 2
+                r_eq = max(rw + rm, 1e-4)
+                decay = float(np.exp(-(r_eq / L_safe) * dt))
+                curr = curr * decay + (v_th / r_eq) * (1.0 - decay)
                 i[k] = curr + rng.normal(0.0, 0.004 * i_ss_base)
             i = np.maximum(0.0, i)
 
@@ -459,9 +474,13 @@ class MotorDiagnosticAI:
             fuera = np.where(np.abs(i - i_ss) > tol)[0]
             t_est_s = float(t[fuera[-1] + 1]) if (len(fuera) > 0 and fuera[-1] + 1 < len(t)) else float(t[-1])
 
-            i_tau_obj = i_p - 0.632 * (i_p - i_ss)
-            post = np.where(i[idx_p:] <= i_tau_obj)[0]
-            tau_ms = float((t[idx_p + post[0]] - t[idx_p]) * 1000.0) if len(post) > 0 else 5.0
+            if i_p > i_ss * 1.02:
+                i_tau_obj = i_p - 0.632 * (i_p - i_ss)
+                post = np.where(i[idx_p:] <= i_tau_obj)[0]
+                tau_ms = float((t[idx_p + post[0]] - t[idx_p]) * 1000.0) if len(post) > 0 else 5.0
+            else:
+                i_tau_obj = i_p
+                tau_ms = 0.0
 
             p = v_ss * i
             p_max = float(np.max(p))
@@ -502,7 +521,6 @@ class MotorDiagnosticAI:
             return feat
 
         rows: List[Dict[str, Any]] = []
-        # Incluir la captura real como ancla de NORMAL
         real_row = baseline.to_feature_dict(baseline=baseline)
         real_row["target"] = "NORMAL"
         rows.append(real_row)
@@ -513,22 +531,22 @@ class MotorDiagnosticAI:
                 v_nom * rng.uniform(0.96, 1.04), rw_est * rng.uniform(0.95, 1.05), L_est,
                 r_minf_est * rng.uniform(0.90, 1.12), tau_base_s * rng.uniform(0.85, 1.15), "NORMAL"
             ))
-            # 2. SOBRECARGA (mayor Iss y mayor tau_m por inercia/carga acoplada)
+            # 2. SOBRECARGA
             rows.append(_simular_curva_rl(
                 v_nom * rng.uniform(0.94, 1.01), rw_est, L_est,
                 r_minf_est * rng.uniform(0.35, 0.62), tau_base_s * rng.uniform(1.65, 2.80), "SOBRECARGA"
             ))
-            # 3. BAJO_VOLTAJE (50% a 82% del voltaje nominal)
+            # 3. BAJO_VOLTAJE
             rows.append(_simular_curva_rl(
                 v_nom * rng.uniform(0.50, 0.82), rw_est, L_est,
                 r_minf_est * rng.uniform(0.90, 1.10), tau_base_s * rng.uniform(0.95, 1.40), "BAJO_VOLTAJE"
             ))
-            # 4. ROZAMIENTO_MECANICO (mayor Iss por par resistente, incremento moderado de tau)
+            # 4. ROZAMIENTO_MECANICO
             rows.append(_simular_curva_rl(
                 v_nom * rng.uniform(0.95, 1.02), rw_est, L_est,
                 r_minf_est * rng.uniform(0.45, 0.72), tau_base_s * rng.uniform(1.05, 1.55), "ROZAMIENTO_MECANICO"
             ))
-            # 5. BLOQUEO_PARCIAL (rotor casi estancado -> FCEM / Rm_inf colapsa a 0..18%)
+            # 5. BLOQUEO_PARCIAL
             rows.append(_simular_curva_rl(
                 v_nom * rng.uniform(0.90, 1.00), rw_est, L_est,
                 r_minf_est * rng.uniform(0.00, 0.18), tau_base_s * rng.uniform(0.40, 1.10), "BLOQUEO_PARCIAL"
@@ -562,7 +580,7 @@ class MotorDiagnosticAI:
         return self.training_metrics
 
     # ==========================================================================
-    # INFERENCIA Y EXPLICABILIDAD FÍSICA
+    # INFERENCIA, CALIBRACIÓN POR PLACA Y EXPLICABILIDAD FÍSICA
     # ==========================================================================
     def _evaluar_reglas_fisicas(self, feat: Dict[str, Any]) -> Tuple[str, float, Dict[str, float]]:
         """Clasificador determinístico de respaldo basado en invariantes RL y desviaciones."""
@@ -574,6 +592,14 @@ class MotorDiagnosticAI:
         norm_iss = feat["norm_iss_ratio"]
         norm_testab = feat["norm_testab_ratio"]
         norm_tau = feat["norm_tau_ratio"]
+
+        # Si no hay curva base pero sí perfil nominal del motor, evitar referencia fija a 12 V
+        if self.baseline_result is None and self.motor_profile is not None:
+            v_ref = self.motor_profile.voltaje_referencia()
+            if v_ref is not None and v_ref > 0:
+                norm_v = feat["v_ss_v"] / v_ref
+            if self.motor_profile.i_nominal_a is not None and self.motor_profile.i_nominal_a > 0:
+                norm_iss = feat["i_ss_a"] / float(self.motor_profile.i_nominal_a)
 
         # 1. Bloqueo parcial / rotor estancado (caída Inrush mínima, FCEM casi nula)
         if ratio_p_ss < 1.45 or caida_pct < 28.0:
@@ -603,6 +629,105 @@ class MotorDiagnosticAI:
         probs = {k: round(v / total, 4) for k, v in scores.items()}
         best_state = max(probs, key=probs.get)
         return best_state, probs[best_state] * 100.0, probs
+
+    def _calibrar_con_perfil_motor(
+        self,
+        result: TransientAnalysisResult,
+        probs: Dict[str, float],
+        hallazgos: List[str],
+    ) -> Tuple[Dict[str, float], List[str]]:
+        """
+        Ajusta las probabilidades del clasificador utilizando los parámetros
+        nominales proporcionados (rango de voltaje, Rw, Inom, Istall).
+        """
+        profile = self.motor_profile
+        if profile is None or not profile.tiene_datos():
+            hallazgos.append(
+                "Perfil nominal no proporcionado: diagnóstico inferido íntegramente desde la curva transitoria."
+            )
+            return probs, hallazgos
+
+        p_adj = dict(probs)
+        v_ss = float(result.v_ss_v)
+        i_ss_a = float(result.i_ss_ma) / 1000.0
+        i_pico_a = float(result.i_pico_suave_ma) / 1000.0
+
+        # A. Validación contra rango de voltaje nominal del motor
+        v_ref = profile.voltaje_referencia()
+        if v_ref is not None and v_ref > 0:
+            v_min = profile.v_nom_min if (profile.v_nom_min is not None and profile.v_nom_min > 0) else 0.88 * v_ref
+            v_max = profile.v_nom_max if (profile.v_nom_max is not None and profile.v_nom_max > 0) else 1.12 * v_ref
+            if v_ss < 0.94 * v_min:
+                deficit = min(1.0, (v_min - v_ss) / max(v_min, 0.1))
+                p_adj["BAJO_VOLTAJE"] = p_adj.get("BAJO_VOLTAJE", 0.0) + 1.5 * (0.4 + deficit)
+                hallazgos.append(
+                    f"[Placa] Subtensión confirmada: V_medido={v_ss:.2f} V < rango nominal ({v_min:.1f}–{v_max:.1f} V)."
+                )
+            elif v_min * 0.94 <= v_ss <= v_max * 1.05:
+                p_adj["BAJO_VOLTAJE"] *= 0.15
+                p_adj["NORMAL"] = p_adj.get("NORMAL", 0.0) + 0.25
+                hallazgos.append(
+                    f"[Placa] Tensión V_medido={v_ss:.2f} V dentro del rango nominal ({v_min:.1f}–{v_max:.1f} V)."
+                )
+            else:
+                hallazgos.append(
+                    f"[Placa] Advertencia de sobretensión: V_medido={v_ss:.2f} V > máximo nominal ({v_max:.1f} V)."
+                )
+
+        # B. Validación contra resistencia interna Rw (separación de FCEM vs Bloqueo)
+        if profile.rw_ohm is not None and profile.rw_ohm > 0 and i_ss_a > 1e-4:
+            rw = float(profile.rw_ohm)
+            r_app = v_ss / i_ss_a
+            ratio_r = r_app / rw
+            if ratio_r <= 1.35:
+                p_adj["BLOQUEO_PARCIAL"] = p_adj.get("BLOQUEO_PARCIAL", 0.0) + 1.8
+                p_adj["NORMAL"] *= 0.10
+                hallazgos.append(
+                    f"[Placa] R_aparente={r_app:.2f} Ω ≈ Rw_placa={rw:.2f} Ω ({ratio_r:.2f}x): ausencia de FCEM (bloqueo de eje)."
+                )
+            elif ratio_r <= 1.85:
+                p_adj["SOBRECARGA"] = p_adj.get("SOBRECARGA", 0.0) + 0.55
+                p_adj["ROZAMIENTO_MECANICO"] = p_adj.get("ROZAMIENTO_MECANICO", 0.0) + 0.55
+                hallazgos.append(
+                    f"[Placa] R_aparente={r_app:.2f} Ω moderada frente a Rw_placa={rw:.2f} Ω ({ratio_r:.2f}x): pérdida de FCEM."
+                )
+            else:
+                p_adj["NORMAL"] = p_adj.get("NORMAL", 0.0) + 0.25
+                hallazgos.append(
+                    f"[Placa] Desarrollo de FCEM saludable: R_aparente={r_app:.2f} Ω ({ratio_r:.2f}x sobre Rw={rw:.2f} Ω)."
+                )
+
+            if i_pico_a > 1e-4:
+                rw_arranque = v_ss / i_pico_a
+                if rw_arranque > 1.45 * rw:
+                    hallazgos.append(
+                        f"[Placa] Nota: Rw aparente en pico ({rw_arranque:.2f} Ω) > Rw nominal ({rw:.2f} Ω); revisar escobillas/contactos."
+                    )
+
+        # C. Validación contra corriente nominal y corriente de rotor bloqueado
+        if profile.i_nominal_a is not None and profile.i_nominal_a > 0:
+            inom = float(profile.i_nominal_a)
+            if i_ss_a > 1.35 * inom:
+                p_adj["SOBRECARGA"] = p_adj.get("SOBRECARGA", 0.0) + 0.75
+                p_adj["ROZAMIENTO_MECANICO"] = p_adj.get("ROZAMIENTO_MECANICO", 0.0) + 0.45
+                p_adj["NORMAL"] *= 0.25
+                hallazgos.append(
+                    f"[Placa] Sobrecorriente estable: Iss={i_ss_a:.2f} A excede I_nominal={inom:.2f} A (+{(i_ss_a/inom - 1)*100:.0f}%)."
+                )
+
+        if profile.i_stall_a is not None and profile.i_stall_a > 0:
+            istall = float(profile.i_stall_a)
+            if i_ss_a >= 0.70 * istall:
+                p_adj["BLOQUEO_PARCIAL"] = p_adj.get("BLOQUEO_PARCIAL", 0.0) + 1.6
+                p_adj["NORMAL"] *= 0.10
+                hallazgos.append(
+                    f"[Placa] Iss={i_ss_a:.2f} A cercana a I_stall={istall:.2f} A: condición crítica de rotor bloqueado."
+                )
+
+        total = sum(max(0.0, val) for val in p_adj.values())
+        if total > 0:
+            p_adj = {k: round(max(0.0, val) / total, 4) for k, val in p_adj.items()}
+        return p_adj, hallazgos
 
     def _construir_explicacion_tecnica(
         self, estado: str, feat: Dict[str, Any]
@@ -662,15 +787,31 @@ class MotorDiagnosticAI:
             probs = {c: 0.0 for c in CANONICAL_STATES}
             for cls_name, p_val in zip(classes, proba_arr):
                 probs[cls_name] = round(float(p_val), 4)
-
-            estado = max(probs, key=probs.get)
-            confianza = probs[estado] * 100.0
             metodo = "IA_RANDOM_FOREST"
         else:
-            estado, confianza, probs = self._evaluar_reglas_fisicas(feat)
+            _, _, probs = self._evaluar_reglas_fisicas(feat)
             metodo = "MOTOR_FISICO_RL"
 
+        hallazgos_placa: List[str] = []
+        probs, hallazgos_placa = self._calibrar_con_perfil_motor(
+            result, probs, hallazgos_placa
+        )
+
+        perfil_resumen: Optional[str] = None
+        id_motor: Optional[int] = None
+        if self.motor_profile is not None and self.motor_profile.tiene_datos():
+            metodo = f"{metodo}+PLACA"
+            perfil_resumen = self.motor_profile.resumen_corto()
+            id_motor = self.motor_profile.id_motor
+
+        estado = max(probs, key=probs.get)
+        confianza = probs[estado] * 100.0
+
         severidad, sintomas, recomendacion = self._construir_explicacion_tecnica(estado, feat)
+        sintomas.extend(hallazgos_placa)
+
+        if severidad == "OK" and any("Advertencia" in h for h in hallazgos_placa):
+            severidad = "ADVERTENCIA"
 
         return DiagnosticReport(
             archivo=result.source_name,
@@ -682,14 +823,14 @@ class MotorDiagnosticAI:
             sintomas_detectados=sintomas,
             recomendacion_tecnica=recomendacion,
             probabilidades_clase=probs,
+            perfil_motor=perfil_resumen,
+            id_motor=id_motor,
         )
 
 
 if __name__ == "__main__":
-    # Uso: python src/core/ai_engine.py [ruta/al/dataset.csv]
     configurar_salida_utf8()
 
-    # Prueba integral sobre el CSV capturado por el ESP32
     ruta_csv = resolver_csv_por_defecto(sys.argv)
 
     procesador = TransientProcessor()

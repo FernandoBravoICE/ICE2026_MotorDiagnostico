@@ -4,8 +4,8 @@ Proyecto: Diagnóstico Inteligente de Motores DC - Expo ICE Impulsa 2026
 Descripción:
     Ventana principal de la estación de diagnóstico con distribución de 2 columnas
     + consola inferior de ancho completo:
-      - Columna izquierda: Diagnóstico IA & Métricas Físicas (arriba) y
-        Explorador de Ensayos CSV (abajo).
+      - Columna izquierda: Especificaciones del motor (Catálogo SQLite/MySQL o Manual),
+        Diagnóstico IA & Métricas Físicas (arriba) y Explorador de Ensayos CSV (abajo).
       - Área central: Visor dual V(t) / I(t) + tarjeta inferior TRANSITORIO SRAM.
       - Área inferior: Consola.
 """
@@ -21,6 +21,7 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QFrame,
@@ -43,48 +44,63 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+RAIZ_PROYECTO = Path(__file__).resolve().parents[2]
+
 try:
     from src.core.ai_engine import (
         CANONICAL_STATES,
         DiagnosticReport,
         MotorDiagnosticAI,
     )
+    from src.core.db_manager import DatabaseManager
+    from src.core.motor_profile import MotorSpecProfile
     from src.core.transient_processor import (
         TransientAnalysisResult,
         TransientProcessor,
     )
     from src.ui.cad_theme import SEVERITY_STYLES, STATE_LABELS_ES
+    from src.ui.motor_spec_panel import MotorSpecPanel
     from src.ui.transient_canvas import TransientCanvas
 except ImportError:
-    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    sys.path.append(str(RAIZ_PROYECTO))
     from src.core.ai_engine import (
         CANONICAL_STATES,
         DiagnosticReport,
         MotorDiagnosticAI,
     )
+    from src.core.db_manager import DatabaseManager
+    from src.core.motor_profile import MotorSpecProfile
     from src.core.transient_processor import (
         TransientAnalysisResult,
         TransientProcessor,
     )
     from src.ui.cad_theme import SEVERITY_STYLES, STATE_LABELS_ES
+    from src.ui.motor_spec_panel import MotorSpecPanel
     from src.ui.transient_canvas import TransientCanvas
 
 
 class MainWindow(QMainWindow):
-    """Estación principal de análisis de transitorios y diagnóstico por IA."""
+    """Estación principal de análisis de transitorios, diagnóstico por IA y bitácora SQLite."""
 
     def __init__(
         self,
         processor: Optional[TransientProcessor] = None,
         ai_engine: Optional[MotorDiagnosticAI] = None,
+        db_manager: Optional[DatabaseManager] = None,
         initial_paths: Optional[List[Path]] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.processor = processor if processor is not None else TransientProcessor()
         self.ai_engine = ai_engine if ai_engine is not None else MotorDiagnosticAI()
-        self.initial_paths = list(initial_paths) if initial_paths else []
+        self.db_manager = db_manager
+        if self.db_manager is None:
+            try:
+                self.db_manager = DatabaseManager()
+            except Exception:
+                self.db_manager = None
 
+        self.initial_paths = list(initial_paths) if initial_paths else []
         self._records: List[Tuple[TransientAnalysisResult, DiagnosticReport]] = []
         self._current_index: int = -1
 
@@ -112,6 +128,8 @@ class MainWindow(QMainWindow):
         if self.ai_engine.classifier is not None:
             origen = self.ai_engine.training_metrics.get("origen", "MODELO_GUARDADO")
             self._log_console(f"Modelo IA cargado correctamente ({origen}).")
+        if self.db_manager is not None:
+            self._log_console(f"Base de datos SQLite activa: {self.db_manager.db_path.name}")
 
         QTimer.singleShot(80, self._load_startup_datasets)
 
@@ -124,12 +142,12 @@ class MainWindow(QMainWindow):
 
     def _build_docks(self) -> None:
         # ----------------------------------------------------------------------
-        # 1. DOCK SUPERIOR IZQUIERDO: DIAGNÓSTICO IA & MÉTRICAS FÍSICAS
+        # 1. DOCK SUPERIOR IZQUIERDO: ESPECIFICACIONES MOTOR + DIAGNÓSTICO IA
         # ----------------------------------------------------------------------
         self.dock_diag = QDockWidget("Diagnóstico IA & Métricas Físicas", self)
         self.dock_diag.setObjectName("DockDiagnosticoIA")
         self.dock_diag.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.dock_diag.setMinimumWidth(330)
+        self.dock_diag.setMinimumWidth(340)
 
         diag_scroll = QScrollArea(self.dock_diag)
         diag_scroll.setWidgetResizable(True)
@@ -139,6 +157,11 @@ class MainWindow(QMainWindow):
         diag_layout = QVBoxLayout(diag_container)
         diag_layout.setContentsMargins(6, 6, 6, 6)
         diag_layout.setSpacing(8)
+
+        # Panel opcional de especificaciones nominales del motor / Catálogo BD
+        self.motor_panel = MotorSpecPanel(parent=diag_container)
+        self.motor_panel.profile_changed.connect(self._on_motor_profile_changed)
+        diag_layout.addWidget(self.motor_panel)
 
         # Tarjeta de estado principal
         self.diag_banner = QFrame()
@@ -231,7 +254,7 @@ class MainWindow(QMainWindow):
         self.dock_explorer = QDockWidget("Explorador de Ensayos CSV", self)
         self.dock_explorer.setObjectName("DockExploradorCSV")
         self.dock_explorer.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        self.dock_explorer.setMinimumWidth(330)
+        self.dock_explorer.setMinimumWidth(340)
 
         exp_widget = QWidget()
         exp_layout = QVBoxLayout(exp_widget)
@@ -327,13 +350,13 @@ class MainWindow(QMainWindow):
                 avail.x() + max(0, (avail.width() - target_w) // 2),
                 avail.y() + max(0, (avail.height() - target_h) // 2),
             )
-            left_w = max(340, min(420, int(target_w * 0.27)))
-            diag_h = max(340, int(target_h * 0.48))
-            exp_h = max(220, int(target_h * 0.30))
+            left_w = max(350, min(430, int(target_w * 0.28)))
+            diag_h = max(390, int(target_h * 0.56))
+            exp_h = max(200, int(target_h * 0.24))
             console_h = max(95, min(130, int(target_h * 0.13)))
         else:
             self.resize(1366, 768)
-            left_w, diag_h, exp_h, console_h = 370, 380, 240, 110
+            left_w, diag_h, exp_h, console_h = 380, 430, 210, 110
 
         self.resizeDocks([self.dock_diag], [left_w], Qt.Horizontal)
         self.resizeDocks([self.dock_diag, self.dock_explorer], [diag_h, exp_h], Qt.Vertical)
@@ -410,6 +433,14 @@ class MainWindow(QMainWindow):
         act_train.triggered.connect(self.run_supervised_training)
         menu_ai.addAction(act_train)
 
+        act_sync_bd = QAction("Recargar Catálogo de Motores (BD)", self)
+        act_sync_bd.triggered.connect(lambda: self.motor_panel.sincronizar_catalogo(silencioso=False))
+        menu_ai.addAction(act_sync_bd)
+
+        act_hist_bd = QAction("Ver Historial de Diagnósticos (SQLite)...", self)
+        act_hist_bd.triggered.connect(self.show_history_dialog)
+        menu_ai.addAction(act_hist_bd)
+
         menu_ai.addSeparator()
 
         act_recalc = QAction("Re-evaluar Ensayo Actual", self)
@@ -439,6 +470,7 @@ class MainWindow(QMainWindow):
             ("Fijar como Base (Esc. 1)", self.set_selected_as_baseline),
             ("Calibrar IA (Bootstrap RL)", self.run_bootstrap_calibration),
             ("Entrenar IA (CSVs Reales)", self.run_supervised_training),
+            ("Historial BD", self.show_history_dialog),
             ("Exportar Matriz CSV", self.export_features_csv),
             ("Exportar Reporte TXT", self.export_report_txt),
         ]
@@ -464,17 +496,94 @@ class MainWindow(QMainWindow):
             self.lbl_status_right.setText("Motor IA: RESPALDO FÍSICO RL")
 
     # ==========================================================================
+    # PERFIL NOMINAL DE MOTOR (PLACA / CATÁLOGO BD)
+    # ==========================================================================
+    def _on_motor_profile_changed(self, profile: MotorSpecProfile) -> None:
+        self.ai_engine.set_motor_profile(profile)
+        resumen = profile.resumen_corto()
+        self._log_console(f"Perfil de motor actualizado: {resumen}")
+        self._rediagnose_all()
+        if not self._records:
+            self.lbl_status_left.setText(f"Perfil activo: {resumen}")
+
+    def _persistir_reporte_bd(self, report: DiagnosticReport) -> None:
+        if self.db_manager is None:
+            return
+        try:
+            perfil = self.ai_engine.motor_profile
+            id_motor = perfil.id_motor if perfil is not None else None
+            reg_id = self.db_manager.registrar_reporte(report, id_motor=id_motor)
+            self._log_console(
+                f"Bitácora SQLite: '{report.archivo}' registrado (ID #{reg_id})."
+            )
+        except Exception as exc:
+            self._log_console(f"[AVISO BD] No se pudo guardar en historial: {exc}")
+
+    def show_history_dialog(self) -> None:
+        if self.db_manager is None:
+            QMessageBox.warning(
+                self, "Base de datos no disponible", "No hay instancia activa de DatabaseManager."
+            )
+            return
+
+        registros = self.db_manager.obtener_historial(limite=100)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Bitácora Histórica de Diagnósticos (SQLite)")
+        dlg.resize(960, 420)
+        vlay = QVBoxLayout(dlg)
+
+        tbl = QTableWidget(len(registros), 9)
+        tbl.setHorizontalHeaderLabels(
+            [
+                "ID",
+                "Fecha",
+                "Motor",
+                "Archivo CSV",
+                "Diagnóstico",
+                "Confianza",
+                "Severidad",
+                "Vss (V)",
+                "Iss (A)",
+            ]
+        )
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        tbl.setAlternatingRowColors(True)
+
+        for r_idx, row in enumerate(registros):
+            tbl.setItem(r_idx, 0, QTableWidgetItem(str(row.get("id_diagnostico", ""))))
+            tbl.setItem(r_idx, 1, QTableWidgetItem(str(row.get("fecha_ensayo", ""))))
+            tbl.setItem(r_idx, 2, QTableWidgetItem(str(row.get("motor", ""))))
+            tbl.setItem(r_idx, 3, QTableWidgetItem(str(row.get("archivo_csv", ""))))
+            tbl.setItem(r_idx, 4, QTableWidgetItem(str(row.get("estado_detectado", ""))))
+            tbl.setItem(r_idx, 5, QTableWidgetItem(f"{row.get('confianza_pct', 0.0):.1f}%"))
+            tbl.setItem(r_idx, 6, QTableWidgetItem(str(row.get("severidad", ""))))
+            vss = row.get("v_ss_v")
+            iss = row.get("i_ss_a")
+            tbl.setItem(r_idx, 7, QTableWidgetItem(f"{vss:.2f}" if vss is not None else "---"))
+            tbl.setItem(r_idx, 8, QTableWidgetItem(f"{iss:.3f}" if iss is not None else "---"))
+
+        tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        vlay.addWidget(tbl)
+
+        btn_close = QPushButton("Cerrar")
+        btn_close.clicked.connect(dlg.accept)
+        vlay.addWidget(btn_close, alignment=Qt.AlignRight)
+        dlg.exec_()
+
+    # ==========================================================================
     # GESTIÓN DE DATASETS Y ACCIONES DE USUARIO
     # ==========================================================================
     def _load_startup_datasets(self) -> None:
         paths_to_load: List[Path] = list(self.initial_paths)
         if not paths_to_load:
-            raw_dir = Path("datasets/raw")
+            raw_dir = RAIZ_PROYECTO / "datasets" / "raw"
             if raw_dir.is_dir():
                 paths_to_load.extend(sorted(raw_dir.glob("*.csv")))
             for candidate in [
-                Path("dataset_Motor_prueba_12V.csv"),
-                Path("dataset_Motor_prueba_12V (1).csv"),
+                RAIZ_PROYECTO / "dataset_Motor_prueba_12V.csv",
+                RAIZ_PROYECTO / "dataset_Motor_prueba_12V (1).csv",
             ]:
                 if candidate.exists() and candidate not in paths_to_load:
                     paths_to_load.append(candidate)
@@ -483,20 +592,24 @@ class MainWindow(QMainWindow):
             self.load_csv_files(paths_to_load)
 
     def open_csv_dialog(self) -> None:
+        default_dir = RAIZ_PROYECTO / "datasets" / "raw"
+        start_dir = str(default_dir if default_dir.exists() else RAIZ_PROYECTO)
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Seleccionar Archivos CSV de Transitorios",
-            str(Path("datasets/raw") if Path("datasets/raw").exists() else Path.cwd()),
+            start_dir,
             "Archivos CSV (*.csv)",
         )
         if files:
             self.load_csv_files([Path(f) for f in files])
 
     def open_folder_dialog(self) -> None:
+        default_dir = RAIZ_PROYECTO / "datasets" / "raw"
+        start_dir = str(default_dir if default_dir.exists() else RAIZ_PROYECTO)
         folder = QFileDialog.getExistingDirectory(
             self,
             "Seleccionar Carpeta con Datasets CSV",
-            str(Path("datasets/raw") if Path("datasets/raw").exists() else Path.cwd()),
+            start_dir,
         )
         if folder:
             csvs = sorted(Path(folder).glob("*.csv"))
@@ -539,6 +652,7 @@ class MainWindow(QMainWindow):
                     f"Procesado '{res.source_name}' [{res.label}] -> "
                     f"{report.estado_detectado} ({report.confianza_pct:.1f}%) | Fs={res.fs_real_hz:.0f} Hz"
                 )
+                self._persistir_reporte_bd(report)
             except Exception as exc:
                 self._log_console(f"[ERROR] No se pudo procesar '{path.name}': {exc}")
 
@@ -584,7 +698,8 @@ class MainWindow(QMainWindow):
             )
             self._log_console(
                 f"Calibración Bootstrap RL completada: Rw={metrics.get('rw_estimado_ohm')} Ω, "
-                f"Rm(∞)={metrics.get('r_minf_estimado_ohm')} Ω, CV={metrics.get('cv_accuracy_pct')}%."
+                f"Rm(∞)={metrics.get('r_minf_estimado_ohm')} Ω, "
+                f"Consistencia={metrics.get('cv_consistencia_sintetica_pct')}%."
             )
             self._update_statusbar_ai()
             self._rediagnose_all()
@@ -729,9 +844,16 @@ class MainWindow(QMainWindow):
         self.lbl_diag_notes.setText(
             f"{sintomas_html}<br><br><b>Acción:</b> {report.recomendacion_tecnica}"
         )
+
+        perfil_sufijo = (
+            f" | Perfil: {self.ai_engine.motor_profile.modelo}"
+            if self.ai_engine.motor_profile is not None
+            and self.ai_engine.motor_profile.tiene_datos()
+            else ""
+        )
         self.lbl_status_left.setText(
             f"Activo: {res.source_name} | Muestras: {res.n_active_samples} | "
-            f"Diagnóstico: {report.estado_detectado} ({report.confianza_pct:.1f}%)"
+            f"Diagnóstico: {report.estado_detectado} ({report.confianza_pct:.1f}%){perfil_sufijo}"
         )
 
     def _clear_diagnostic_view(self) -> None:
@@ -807,7 +929,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        default_dir = Path("datasets/processed")
+        default_dir = RAIZ_PROYECTO / "datasets" / "processed"
         default_dir.mkdir(parents=True, exist_ok=True)
         filepath, _ = QFileDialog.getSaveFileName(
             self,
@@ -818,11 +940,19 @@ class MainWindow(QMainWindow):
         if not filepath:
             return
 
+        perfil = self.ai_engine.motor_profile
+        perfil_str = (
+            perfil.resumen_corto()
+            if (perfil is not None and perfil.tiene_datos())
+            else "No especificado"
+        )
+
         rows: List[Dict[str, Any]] = []
         for res, report in self._records:
             row = {
                 "archivo": res.source_name,
                 "etiqueta_csv": res.label,
+                "perfil_motor": perfil_str,
                 "diagnostico_ia": report.estado_detectado,
                 "confianza_pct": report.confianza_pct,
                 "severidad": report.severidad,
